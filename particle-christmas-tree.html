@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Gemini Photo Particle Sphere</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050505;
+            font-family: 'Arial', sans-serif;
+        }
+        #ui-container {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+            color: white;
+            background: rgba(0,0,0,0.5);
+            padding: 15px;
+            border-radius: 8px;
+        }
+        input[type=file] {
+            display: block;
+            margin-top: 10px;
+            color: #fff;
+        }
+        #loading {
+            display: none;
+            color: #4dabf7;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        #instructions {
+            position: absolute;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: #888;
+            pointer-events: none;
+            user-select: none;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <div style="font-size: 18px; margin-bottom: 10px;">✨ 上传照片生成粒子球</div>
+        <input type="file" id="imageInput" accept="image/*">
+        <div id="loading">正在处理照片并生成粒子...</div>
+    </div>
+
+    <div id="instructions">上传照片后，移动鼠标与球体交互 | Move mouse to interact</div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        // --- 配置区域 ---
+        const CONFIG = {
+            sphereRadius: 120,   // 球体半径
+            particleSize: 3.0,   // 粒子大小
+            sphereDetail: 100,   // 球体精细度 (越大粒子越多，也越卡。建议 80-120)
+            repulsionRadius: 90, // 鼠标排斥范围
+            repulsionForce: 8,   // 排斥力度
+            returnSpeed: 0.08,   // 粒子回归速度
+            damping: 0.90        // 阻尼(摩擦力)
+        };
+
+        let scene, camera, renderer, particlesMesh;
+        // 鼠标位置我们依然映射到屏幕平面上， Z 设为 0 作为参考层
+        let mouse = new THREE.Vector3(-9999, -9999, 0); 
+        
+        // 用于存储粒子物理属性的数据结构
+        // { x, y, z, vx, vy, vz, baseX, baseY, baseZ }
+        let particlePhysicsData = [];
+
+        const imageInput = document.getElementById('imageInput');
+        const loadingDiv = document.getElementById('loading');
+
+        init();
+        animate();
+
+        // 监听文件上传
+        imageInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            loadingDiv.style.display = 'block';
+            
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                const img = new Image();
+                img.onload = function() {
+                    // 图片加载完成后，开始创建球体
+                    createSphereFromImage(img);
+                    loadingDiv.style.display = 'none';
+                };
+                img.src = event.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+            camera.position.z = 400;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            // 添加一点环境光，虽然 PointsMaterial 不受光照影响，但这是好习惯
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+
+            window.addEventListener('resize', onWindowResize, false);
+            document.addEventListener('mousemove', onMouseMove, false);
+        }
+
+        function createSphereFromImage(imageObj) {
+            // 清除旧的粒子
+            if (particlesMesh) {
+                scene.remove(particlesMesh);
+                particlesMesh.geometry.dispose();
+                particlesMesh.material.dispose();
+            }
+            particlePhysicsData = [];
+
+            // 1. 使用 Canvas 读取图片颜色数据
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            // 将 canvas 大小设置为图片大小，但限制最大尺寸以防性能爆炸
+            const maxWidth = 1024;
+            const scaleFactor = Math.min(1, maxWidth / imageObj.width);
+            canvas.width = imageObj.width * scaleFactor;
+            canvas.height = imageObj.height * scaleFactor;
+            
+            ctx.drawImage(imageObj, 0, 0, canvas.width, canvas.height);
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+            // 2. 创建一个高精度的球体几何体来获取顶点
+            const tempGeo = new THREE.SphereGeometry(CONFIG.sphereRadius, CONFIG.sphereDetail, CONFIG.sphereDetail);
+            const vertices = tempGeo.attributes.position.array;
+            const uvs = tempGeo.attributes.uv.array;
+
+            const particlePositions = [];
+            const particleColors = [];
+
+            // 3. 遍历球体的每个顶点，根据其 UV 坐标去图片上采色
+            for (let i = 0; i < vertices.length / 3; i++) {
+                const x = vertices[i * 3];
+                const y = vertices[i * 3 + 1];
+                const z = vertices[i * 3 + 2];
+
+                // 获取该顶点的 UV 坐标 (范围 0.0 - 1.0)
+                const u = uvs[i * 2];
+                const v = uvs[i * 2 + 1];
+
+                // 将 UV 映射到图片像素坐标
+                const pixelX = Math.floor(u * (canvas.width - 1));
+                // 注意：纹理的 V 坐标通常是反的，需要用 1.0 减去
+                const pixelY = Math.floor((1.0 - v) * (canvas.height - 1));
+                
+                const pixelIndex = (pixelX + pixelY * canvas.width) * 4;
+
+                // 读取 RGB 值并归一化到 0.0 - 1.0
+                const r = imgData[pixelIndex] / 255;
+                const g = imgData[pixelIndex + 1] / 255;
+                const b = imgData[pixelIndex + 2] / 255;
+
+                // 保存位置和颜色
+                particlePositions.push(x, y, z);
+                particleColors.push(r, g, b);
+
+                // 初始化物理数据
+                particlePhysicsData.push({
+                    x: x, y: y, z: z,        // 当前位置
+                    vx: 0, vy: 0, vz: 0,     // 速度
+                    baseX: x, baseY: y, baseZ: z // 原始目标位置
+                });
+            }
+
+            // 4. 创建最终的粒子系统
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(particlePositions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(particleColors, 3));
+
+            const material = new THREE.PointsMaterial({
+                size: CONFIG.particleSize,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending, // 发光叠加效果
+                transparent: true,
+                opacity: 0.9,
+                depthWrite: false // 防止粒子相互遮挡产生黑边
+            });
+
+            particlesMesh = new THREE.Points(geometry, material);
+            scene.add(particlesMesh);
+
+            // 清理临时几何体
+            tempGeo.dispose();
+        }
+
+        function onMouseMove(event) {
+            // 将鼠标坐标转换到世界坐标系的平面上 (简化处理)
+            // 这里的映射比例可能需要根据摄像机距离微调，为了视觉效果，我们做一个近似映射
+            const scale = 0.5; 
+            mouse.x = (event.clientX - window.innerWidth / 2) * scale;
+            mouse.y = -(event.clientY - window.innerHeight / 2) * scale;
+            // mouse.z 保持为 0，相当于鼠标在球体中心所在的平面上移动
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (!particlesMesh) return;
+
+            const positions = particlesMesh.geometry.attributes.position.array;
+            
+            // 让整个球体缓慢自转
+            particlesMesh.rotation.y += 0.002;
+            // 需要更新物体的世界矩阵，以便后续物理计算使用转换后的坐标（这是高级玩法，这里我们简化，只转视觉模型）
+            particlesMesh.updateMatrixWorld();
+
+
+            for (let i = 0; i < particlePhysicsData.length; i++) {
+                const data = particlePhysicsData[i];
+                
+                // --- 物理计算 (现在是 3D 的了) ---
+
+                // 1. 计算粒子到“鼠标射线”的距离
+                // 为了交互效果更直观，我们计算粒子在屏幕平面投影到鼠标点的距离。
+                // 这样鼠标扫过屏幕，就能推开对应位置的所有深度的粒子。
+                const dxScreen = mouse.x - data.x;
+                const dyScreen = mouse.y - data.y;
+                const distanceScreenSq = dxScreen * dxScreen + dyScreen * dyScreen;
+                const distanceScreen = Math.sqrt(distanceScreenSq);
+
+                // 2. 鼠标斥力 (主要在垂直于视线的方向施加力)
+                if (distanceScreen < CONFIG.repulsionRadius) {
+                    const forceFactor = (CONFIG.repulsionRadius - distanceScreen) / CONFIG.repulsionRadius;
+                    // 向外推的向量归一化
+                    const pushX = dxScreen / distanceScreen;
+                    const pushY = dyScreen / distanceScreen;
+                    
+                    data.vx -= pushX * forceFactor * CONFIG.repulsionForce;
+                    data.vy -= pushY * forceFactor * CONFIG.repulsionForce;
+                    // Z 轴方向稍微给一点随机扰动，增加立体感
+                    data.vz += (Math.random() - 0.5) * forceFactor * 0.5; 
+                }
+
+                // 3. 回归原位 (弹力，3D方向)
+                data.vx += (data.baseX - data.x) * CONFIG.returnSpeed;
+                data.vy += (data.baseY - data.y) * CONFIG.returnSpeed;
+                data.vz += (data.baseZ - data.z) * CONFIG.returnSpeed;
+
+                // 4. 阻尼 (摩擦力，防止无限弹跳)
+                data.vx *= CONFIG.damping;
+                data.vy *= CONFIG.damping;
+                data.vz *= CONFIG.damping;
+
+                // 5. 更新位置
+                data.x += data.vx;
+                data.y += data.vy;
+                data.z += data.vz;
+
+                // 写回 Geometry
+                positions[i * 3] = data.x;
+                positions[i * 3 + 1] = data.y;
+                positions[i * 3 + 2] = data.z;
+            }
+
+            particlesMesh.geometry.attributes.position.needsUpdate = true;
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Neon Particle Sphere</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000; /* 纯黑背景让发光更明显 */
+            touch-action: none; /* 禁止手机默认的滑动翻页行为 */
+            font-family: 'Helvetica Neue', sans-serif;
+        }
+        
+        /* 炫酷的悬浮按钮 */
+        #ui-container {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 100;
+            text-align: center;
+            width: 100%;
+        }
+
+        .upload-btn {
+            background: linear-gradient(45deg, #ff00cc, #3333ff);
+            border: none;
+            padding: 12px 24px;
+            border-radius: 30px;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            box-shadow: 0 0 15px rgba(255, 0, 204, 0.5);
+            cursor: pointer;
+            outline: none;
+            transition: transform 0.1s;
+        }
+
+        .upload-btn:active {
+            transform: scale(0.95);
+        }
+
+        input[type=file] {
+            display: none;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #fff;
+            font-size: 14px;
+            text-shadow: 0 0 10px #00ffff;
+            display: none;
+            pointer-events: none;
+        }
+        
+        #hint {
+            position: absolute;
+            top: 20px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255,255,255,0.5);
+            font-size: 12px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="hint">用手指触摸屏幕与粒子互动 ✨</div>
+    <div id="loading">正在解析全息影像...</div>
+
+    <div id="ui-container">
+        <label class="upload-btn">
+            📷 换张照片
+            <input type="file" id="imageInput" accept="image/*">
+        </label>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        // --- 手机版配置 (针对性能和视觉优化) ---
+        const CONFIG = {
+            sphereRadius: window.innerWidth < 500 ? 140 : 180, // 根据屏幕宽度调整球体大小
+            particleSize: window.devicePixelRatio > 1 ? 5.0 : 3.0, // 高清屏粒子大一点
+            sphereDetail: 80,    // 手机上适当降低精度以保流畅 (电脑可设120)
+            repulsionRadius: 100,
+            repulsionForce: 10,
+            returnSpeed: 0.1,
+            breathingSpeed: 0.002, // 呼吸速度
+            breathingRange: 5      // 呼吸幅度
+        };
+
+        let scene, camera, renderer, particlesMesh;
+        let mouse = new THREE.Vector3(-9999, -9999, 0);
+        let particlePhysicsData = [];
+        let isTouching = false;
+        let time = 0;
+
+        const imageInput = document.getElementById('imageInput');
+        const loadingDiv = document.getElementById('loading');
+
+        init();
+        // 默认生成一个炫酷的渐变球
+        createDefaultNeonSphere();
+        animate();
+
+        // --- 事件监听 ---
+        imageInput.addEventListener('change', handleImageUpload);
+        
+        // 触摸开始
+        document.addEventListener('touchstart', (e) => {
+            isTouching = true;
+            updateTouchPosition(e.touches[0]);
+        }, { passive: false });
+
+        // 触摸移动
+        document.addEventListener('touchmove', (e) => {
+            e.preventDefault(); // 极其重要：防止页面滚动
+            if(isTouching) updateTouchPosition(e.touches[0]);
+        }, { passive: false });
+
+        // 触摸结束
+        document.addEventListener('touchend', () => {
+            isTouching = false;
+            // 手指离开后，把斥力点移走
+            mouse.set(-9999, -9999, 0);
+        });
+
+        // 兼容电脑鼠标
+        document.addEventListener('mousemove', (e) => {
+            mouse.x = (e.clientX - window.innerWidth / 2);
+            mouse.y = -(e.clientY - window.innerHeight / 2);
+        });
+
+        function updateTouchPosition(touch) {
+            mouse.x = (touch.clientX - window.innerWidth / 2);
+            mouse.y = -(touch.clientY - window.innerHeight / 2);
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+            // 加上雾效，让远处的粒子淡出，更有纵深感
+            scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+            camera.position.z = 400;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio); // 适配手机高清屏
+            document.body.appendChild(renderer.domElement);
+
+            window.addEventListener('resize', onWindowResize, false);
+        }
+
+        // --- 核心：程序化生成发光纹理 (不需要外部图片) ---
+        function getGlowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32;
+            canvas.height = 32;
+            const ctx = canvas.getContext('2d');
+            
+            // 绘制径向渐变：中心亮白 -> 中间原色 -> 边缘透明
+            const gradient = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+            gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            gradient.addColorStop(0.4, 'rgba(255, 255, 255, 0.3)');
+            gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, 32, 32);
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        function createParticles(positions, colors) {
+             if (particlesMesh) {
+                scene.remove(particlesMesh);
+                particlesMesh.geometry.dispose();
+                particlesMesh.material.dispose();
+            }
+
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+            // 这是一个更高级的材质
+            const material = new THREE.PointsMaterial({
+                size: CONFIG.particleSize,
+                map: getGlowTexture(), // 使用发光纹理
+                vertexColors: true,
+                blending: THREE.AdditiveBlending, // 叠加混合模式（关键：让粒子重叠处变亮）
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.9
+            });
+
+            particlesMesh = new THREE.Points(geometry, material);
+            scene.add(particlesMesh);
+        }
+
+        // 生成默认的霓虹球（未上传照片时）
+        function createDefaultNeonSphere() {
+            particlePhysicsData = [];
+            const positions = [];
+            const colors = [];
+
+            const tempGeo = new THREE.SphereGeometry(CONFIG.sphereRadius, CONFIG.sphereDetail, CONFIG.sphereDetail);
+            const vertices = tempGeo.attributes.position.array;
+
+            const color1 = new THREE.Color(0x00ffff); // 青色
+            const color2 = new THREE.Color(0xff00cc); // 洋红
+
+            for (let i = 0; i < vertices.length / 3; i++) {
+                const x = vertices[i * 3];
+                const y = vertices[i * 3 + 1];
+                const z = vertices[i * 3 + 2];
+
+                positions.push(x, y, z);
+
+                // 根据 Y 轴位置混合颜色
+                const alpha = (y + CONFIG.sphereRadius) / (CONFIG.sphereRadius * 2);
+                const c = color1.clone().lerp(color2, alpha);
+                colors.push(c.r, c.g, c.b);
+
+                particlePhysicsData.push({
+                    x: x, y: y, z: z,
+                    vx: 0, vy: 0, vz: 0,
+                    baseX: x, baseY: y, baseZ: z
+                });
+            }
+            tempGeo.dispose();
+            createParticles(positions, colors);
+        }
+
+        function handleImageUpload(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            loadingDiv.style.display = 'block';
+            
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                const img = new Image();
+                img.onload = function() {
+                    createSphereFromImage(img);
+                    loadingDiv.style.display = 'none';
+                };
+                img.src = event.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function createSphereFromImage(imageObj) {
+            particlePhysicsData = [];
+            
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            const maxWidth = 512; // 手机上降低采样分辨率以提高性能
+            const scaleFactor = Math.min(1, maxWidth / imageObj.width);
+            canvas.width = imageObj.width * scaleFactor;
+            canvas.height = imageObj.height * scaleFactor;
+            
+            ctx.drawImage(imageObj, 0, 0, canvas.width, canvas.height);
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+            const tempGeo = new THREE.SphereGeometry(CONFIG.sphereRadius, CONFIG.sphereDetail, CONFIG.sphereDetail);
+            const vertices = tempGeo.attributes.position.array;
+            const uvs = tempGeo.attributes.uv.array;
+
+            const positions = [];
+            const colors = [];
+
+            for (let i = 0; i < vertices.length / 3; i++) {
+                const x = vertices[i * 3];
+                const y = vertices[i * 3 + 1];
+                const z = vertices[i * 3 + 2];
+
+                const u = uvs[i * 2];
+                const v = uvs[i * 2 + 1];
+                const pixelX = Math.floor(u * (canvas.width - 1));
+                const pixelY = Math.floor((1.0 - v) * (canvas.height - 1));
+                const pixelIndex = (pixelX + pixelY * canvas.width) * 4;
+
+                positions.push(x, y, z);
+                
+                // 颜色增强：提高饱和度让粒子更亮
+                const r = Math.min(1, (imgData[pixelIndex] / 255) * 1.2);
+                const g = Math.min(1, (imgData[pixelIndex + 1] / 255) * 1.2);
+                const b = Math.min(1, (imgData[pixelIndex + 2] / 255) * 1.2);
+                colors.push(r, g, b);
+
+                particlePhysicsData.push({
+                    x: x, y: y, z: z,
+                    vx: 0, vy: 0, vz: 0,
+                    baseX: x, baseY: y, baseZ: z
+                });
+            }
+            tempGeo.dispose();
+            createParticles(positions, colors);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (!particlesMesh) return;
+
+            time += CONFIG.breathingSpeed;
+            
+            // 1. 全局旋转
+            particlesMesh.rotation.y += 0.003;
+            particlesMesh.rotation.x = Math.sin(time) * 0.1;
+
+            const positions = particlesMesh.geometry.attributes.position.array;
+            
+            // 2. 呼吸效果系数
+            const breatheFactor = 1 + Math.sin(time * 5) * 0.03;
+
+            for (let i = 0; i < particlePhysicsData.length; i++) {
+                const data = particlePhysicsData[i];
+                
+                // 计算呼吸后的目标位置
+                const targetX = data.baseX * breatheFactor;
+                const targetY = data.baseY * breatheFactor;
+                const targetZ = data.baseZ * breatheFactor;
+
+                // 物理：斥力计算
+                // 为了性能，手机上我们只算平面距离的近似值
+                const dx = mouse.x - data.x;
+                const dy = mouse.y - data.y;
+                // 简单的距离检查优化
+                if (Math.abs(dx) < CONFIG.repulsionRadius && Math.abs(dy) < CONFIG.repulsionRadius) {
+                    const distSq = dx*dx + dy*dy;
+                    if (distSq < CONFIG.repulsionRadius * CONFIG.repulsionRadius) {
+                        const dist = Math.sqrt(distSq);
+                        const force = (CONFIG.repulsionRadius - dist) / CONFIG.repulsionRadius;
+                        
+                        // 斥力加入一点旋转因子，让粒子像漩涡一样散开
+                        const angle = Math.atan2(dy, dx);
+                        
+                        data.vx -= Math.cos(angle) * force * CONFIG.repulsionForce;
+                        data.vy -= Math.sin(angle) * force * CONFIG.repulsionForce;
+                        data.vz -= force * CONFIG.repulsionForce * 0.5; 
+                    }
+                }
+
+                // 物理：回归
+                data.vx += (targetX - data.x) * CONFIG.returnSpeed;
+                data.vy += (targetY - data.y) * CONFIG.returnSpeed;
+                data.vz += (targetZ - data.z) * CONFIG.returnSpeed;
+
+                // 物理：阻尼
+                data.vx *= 0.92;
+                data.vy *= 0.92;
+                data.vz *= 0.92;
+
+                data.x += data.vx;
+                data.y += data.vy;
+                data.z += data.vz;
+
+                positions[i * 3] = data.x;
+                positions[i * 3 + 1] = data.y;
+                positions[i * 3 + 2] = data.z;
+            }
+
+            particlesMesh.geometry.attributes.position.needsUpdate = true;
+            renderer.render(scene, camera);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
